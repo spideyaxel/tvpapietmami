@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TV Facile – Lecteur M3U (HLS + DASH)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Preload HLS (with fallback loader in JS if this CDN fails) -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.4.12/dist/hls.min.js"></script>
+  <!-- NOTE: dashjs may be blocked/not reachable in some sandboxes. We'll lazy-load it at runtime if needed. -->
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, sans-serif; background:#121212; color:#e5e5e5; }
+    #video-player-container.hidden { display:none; }
+    .grid-container { display:grid; gap:1.25rem; padding:1.25rem; grid-template-columns: repeat(auto-fill, minmax(200px,1fr)); }
+    .channel-card { 
+      background:#1f1f1f; 
+      border:2px solid transparent; 
+      border-radius:1rem; 
+      cursor:pointer; 
+      text-align:center; 
+      padding:1rem; 
+      display:flex; 
+      flex-direction:column; 
+      align-items:center; 
+      justify-content:center; 
+      transition:transform .15s, border-color .15s; 
+      position: relative; 
+      overflow: hidden;
+    }
+    .channel-card:hover, .channel-card:focus { transform:scale(1.03); border-color:#22c55e; }
+    .channel-card img { max-width:100px; max-height:100px; border-radius:.5rem; object-fit:contain; }
+    .channel-card span { margin-top:.75rem; font-size:1.05rem; font-weight:600; }
+    .channel-card.selected {
+      border-color: #22c55e;
+      box-shadow: 0 0 0 4px #22c55e, 0 4px 24px #22c55e44;
+      background: #232a1e;
+      transform: scale(1.08);
+      transition: background 0.15s, box-shadow 0.15s, transform 0.15s;
+    }
+    #video-player-container { position:fixed; inset:0; background:#000; z-index:50; display:flex; justify-content:center; align-items:center; }
+    #video-player { width:100%; height:100%; }
+    #loading-message, #error-message { position:absolute; left:50%; transform:translateX(-50%); color:white; z-index:60; display:none; text-align:center; }
+    #loading-message { top:15%; font-size:1.25rem; }
+    #error-message { bottom:10%; background:rgba(0,0,0,.75); padding:.75rem 1rem; border-radius:.5rem; max-width:min(90%,720px); }
+    .badge { font-size:.75rem; padding:.125rem .5rem; border-radius:.5rem; background:#27272a; border:1px solid #3f3f46; }
+    .status-ok { color:#22c55e; }
+    .status-bad { color:#ef4444; }
+    .filter-btn.selected {
+      background-color: #22c55e;
+      color: #121212;
+      font-weight: bold;
+    }
+    .programme-info {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(5px);
+      -webkit-backdrop-filter: blur(5px);
+      padding: 0.5rem;
+      border-bottom-left-radius: 1rem;
+      border-bottom-right-radius: 1rem;
+      text-align: left;
+      display: none;
+      flex-direction: column;
+      justify-content: flex-end;
+    }
+    .channel-card:hover .programme-info, .channel-card.selected .programme-info {
+        display: flex;
+    }
+    .programme-info h4 {
+        font-size: 0.9rem;
+        font-weight: bold;
+        line-height: 1.2;
+    }
+    .programme-info p {
+        font-size: 0.75rem;
+        color: #ccc;
+        margin-top: 0.25rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="p-6">
+    <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
+      <div>
+        <h1 class="text-3xl font-bold">TV Facile</h1>
+        <p class="text-sm text-gray-400">Cliquez sur une chaîne pour la regarder. Appuyez sur une touche ou <kbd class="badge">Échap</kbd> pour revenir à la liste.</p>
+      </div>
+      <div class="text-sm flex gap-2 items-center">
+        <span id="hls-status" class="badge">HLS: …</span>
+        <span id="dash-status" class="badge">DASH: …</span>
+        <button id="btn-selftest" class="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500">Auto‑test</button>
+      </div>
+    </div>
+    <div class="mt-4 flex flex-wrap gap-2" id="filter-bar">
+      <!-- Les boutons de filtre seront générés ici par le script JS -->
+    </div>
+  </div>
+
+  <div id="channel-list" class="grid-container"></div>
+  <div id="video-player-container" class="hidden">
+    <video id="video-player" controls autoplay playsinline muted></video>
+    <div id="loading-message">Chargement…</div>
+    <div id="error-message">Impossible de charger cette chaîne.</div>
+    <div id="programme-display" class="absolute bottom-4 left-4 p-4 rounded-lg backdrop-blur-md bg-black bg-opacity-70 text-white shadow-lg hidden"></div>
+  </div>
+
+  <script>
+    // ------------------------------
+    // Helpers: dynamic script loader & capability checks
+    // ------------------------------
+    const HLS_CDNS = [
+      'https://cdn.jsdelivr.net/npm/hls.js@1.4.12/dist/hls.min.js',
+      'https://unpkg.com/hls.js@1.4.12/dist/hls.min.js',
+      'https://cdn.jsdelivr.net/npm/hls.js@latest'
+    ];
+    const DASH_CDNS = [
+      'https://cdn.jsdelivr.net/npm/dashjs@4.7.3/dist/dash.all.min.js',
+      'https://unpkg.com/dashjs@4.7.3/dist/dash.all.min.js',
+      'https://cdn.dashjs.org/latest/dash.all.min.js'
+    ];
+
+    function loadScriptOnce(url){
+      return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = url; s.async = true; s.defer = true;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error('Failed: ' + url));
+        document.head.appendChild(s);
+      });
+    }
+
+    async function ensureLib(globalName, urls){
+      if (window[globalName]) return true;
+      for (const u of urls){
+        try { await loadScriptOnce(u); if (window[globalName]) return true; } catch(e) { /* try next */ }
+      }
+      return !!window[globalName];
+    }
+
+    function isProbablyHls(url){ return /\.m3u8(\?|$)/i.test(url); }
+    function isProbablyDash(url){ return /\.mpd(\?|$)/i.test(url); }
+
+    // ------------------------------
+    // Données des chaînes (M3U) et du programme (XMLTV)
+    // ------------------------------
+    const m3uData = `#EXTM3U
+#EXTINF:-1 tvg-id="TF1.fr" tvg-name="TF1" tvg-logo="https://i.imgur.com/QxHt9NC.png" group-title="entertainment",TF1
+https://viamotionhsi.netplus.ch/live/eds/tf1hd/browser-dash/tf1hd.mpd
+#EXTINF:-1 tvg-id="France2.fr" tvg-name="France 2" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/5/53/France_2_2018.svg/512px-France_2_2018.svg.png" group-title="general",France 2
+https://viamotionhsi.netplus.ch/live/eds/france2hd/browser-dash/france2hd.mpd
+#EXTINF:-1 tvg-id="France3.fr" tvg-name="France 3" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/7/75/France_3_Rh%C3%B4ne-Alpes_-_Logo_2018.svg" group-title="general",France 3
+https://viamotionhsi.netplus.ch/live/eds/france3hd/browser-dash/france3hd.mpd
+#EXTINF:-1 tvg-id="France4.fr" tvg-name="France 4" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/3/3b/France_4_2018.svg/512px-France_4_2018.svg.png" group-title="general",France 4
+https://viamotionhsi.netplus.ch/live/eds/france4hd/browser-dash/france4hd.mpd
+#EXTINF:-1 tvg-id="France5.fr" tvg-name="France 5" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/5/50/France_5_2018.svg/512px-France_5_2018.svg.png" group-title="general",France 5
+https://viamotionhsi.netplus.ch/live/eds/france5hd/browser-dash/france5hd.mpd
+#EXTINF:-1 tvg-id="M6.fr" tvg-name="M6" tvg-logo="https://i.imgur.com/7GVp3fW.png" group-title="entertainment",M6
+https://viamotionhsi.netplus.ch/live/eds/m6hd/browser-dash/m6hd.mpd
+#EXTINF:-1 tvg-id="arte.fr" tvg-name="arte" tvg-logo="https://i.imgur.com/ecXMjNl.png" group-title="entertainment",arte
+https://artesimulcast.akamaized.net/hls/live/2031003/artelive_fr/index.m3u8
+
+#EXTINF:-1 tvg-id="W9.fr" tvg-name="W9" tvg-logo="https://i.imgur.com/reYeMuE.png" group-title="entertainment",W9
+https://viamotionhsi.netplus.ch/live/eds/w9/browser-dash/w9.mpd
+#EXTINF:-1 tvg-id="TMC.fr" tvg-name="TMC" tvg-logo="https://upload.wikimedia.org/wikipedia/en/thumb/5/54/TMC_logo.svg/512px-TMC_logo.svg.png" group-title="general",TMC
+https://viamotionhsi.netplus.ch/live/eds/tmc/browser-HLS8/tmc.m3u8
+#EXTINF:-1 tvg-id="TFX.fr" tvg-name="TFX" tvg-logo="https://i.imgur.com/d91GcVf.png" group-title="general",TFX
+https://viamotionhsi.netplus.ch/live/eds/nt1/browser-dash/nt1.mpd
+
+#EXTINF:-1 tvg-id="LCP.fr" tvg-name="LCP" tvg-logo="https://i.imgur.com/k7UImOJ.png" group-title="legislative",LCP
+https://viamotionhsi.netplus.ch/live/eds/lcp/browser-HLS8/lcp.m3u8
+
+#EXTINF:-1 tvg-id="BFMTV.fr" tvg-name="BFM TV" tvg-logo="https://i.imgur.com/YJCcczD.png" group-title="news",BFM TV
+https://ncdn-live-bfm.pfd.sfr.net/shls/LIVE$BFM_TV/index.m3u8?end=END&start=LIVE
+
+#EXTINF:-1 tvg-id="CStar.fr" tvg-name="C Star" tvg-logo="https://i.imgur.com/w4kAX1V.png" group-title="entertainment",C Star
+https://viamotionhsi.netplus.ch/live/eds/d17/browser-HLS8/d17.m3u8
+#EXTINF:-1 tvg-id="Gulli.fr" tvg-name="Gulli" tvg-logo="https://i.imgur.com/kqYssbW.png" group-title="kids",Gulli
+https://viamotionhsi.netplus.ch/live/eds/gulli/browser-HLS8/gulli.m3u8
+#EXTINF:-1 tvg-id="TF1SeriesFilms.fr" tvg-name="TF1 Series Films" tvg-logo="https://i.imgur.com/4CJIDKQ.png" group-title="movies",TF1 Series Films
+https://viamotionhsi.netplus.ch/live/eds/hd1/browser-HLS8/hd1.m3u8
+#EXTINF:-1 tvg-id="LEquipe.fr" tvg-name="L'Equipe" tvg-logo="https://i.imgur.com/t35zhM9.png" group-title="sports",L'Equipe
+https://dshn8inoshngm.cloudfront.net/v1/master/3722c60a815c199d9c0ef36c5b73da68a62b09d1/cc-gac2i63dmu8b7/LEquipe_FR.m3u8
+#EXTINF:-1 tvg-id="6ter.fr" tvg-name="6ter" tvg-logo="https://i.imgur.com/2nd5Cox.png" group-title="entertainment",6ter
+https://viamotionhsi.netplus.ch/live/eds/6ter/browser-HLS8/6ter.m3u8
+#EXTINF:-1 tvg-id="RMCStory.fr" tvg-name="RMC Story" tvg-logo="https://i.imgur.com/h53nsyJ.png" group-title="general",RMC Story
+https://viamotionhsi.netplus.ch/live/eds/numero23/browser-HLS8/numero23.m3u8
+#EXTINF:-1 tvg-id="RMCDecouverte.fr" tvg-name="RMC Decouverte" tvg-logo="https://upload.wikimedia.org/wikipedia/fr/thumb/b/b3/RMC_D%C3%A9couverte_logo_2017.svg/langfr-350px-RMC_D%C3%A9couverte_logo_2017.svg.png" group-title="general",RMC Decouverte
+https://viamotionhsi.netplus.ch/live/eds/rmcdecouverte/browser-HLS8/rmcdecouverte.m3u8
+#EXTINF:-1 tvg-id="Cherie25.fr" tvg-name="Cherie 25" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/2/2e/Logo_Ch%C3%A9rie_25.svg/512px-Logo_Ch%C3%A9rie_25.svg.png" group-title="general",Cherie 25
+https://cherie25.nrjaudio.fm/hls/live/2038375/c25/master.m3u8
+#EXTINF:-1 tvg-id="LCI.fr" tvg-name="LCI" tvg-logo="https://i.imgur.com/DED8EXs.png" group-title="news",LCI
+https://raw.githubusercontent.com/ipstreet312/freeiptv/master/ressources/btv/py/lci1.m3u8
+#EXTINF:-1 tvg-id="WildSideTV.fr" tvg-name="Wild Side TV" tvg-logo="https://i.imgur.com/cQkfRhH.png" group-title="movies",Wild Side TV
+https://versatile-wildsidetv-1-fr.samsung.wurl.tv/playlist.m3u8
+#EXTINF:-1 tvg-id="BFM2.fr" tvg-name="BFM2" tvg-logo="https://alloforfait.fr/wp-content/uploads/2024/03/logo-bfm2-300x200.jpg" group-title="news",BFM2
+https://d1ib1gsg71oarf.cloudfront.net/v1/master/3722c60a815c199d9c0ef36c5b73da68a62b09d1/cc-scp7wda722jph/BFM2_FR.m3u8
+#EXTINF:-1 tvg-id="XilamTV.fr" tvg-name="XilamTV" tvg-logo="https://yt3.googleusercontent.com/ytc/AIdro_k6spR1AVLZ0ISqrFP-Z9JeBMHPpAc9T-pmFlG6_lSkNw=s160-c-k-c0x00ffffff-no-rj" group-title="animation",XilamTV
+https://xilam-animation-1-fr.samsung.wurl.tv/playlist.m3u8
+#EXTINF:-1 tvg-id="viaTelePaese.fr" tvg-name="viaTelePaese" tvg-logo="https://i.imgur.com/TLZsAKK.png" group-title="general",viaTelePaese
+https://srv.webtvmanager.fr:3970/live/viatelepaeselive.m3u8
+#EXTINF:-1 tvg-id="ViaMatele.fr" tvg-name="ViaMatele" tvg-logo="https://i.imgur.com/XVCV9rj.png" group-title="general",ViaMatele
+https://5dd226f8f01e8.streamlock.net/via-matele-live/matelelive_1080/playlist.m3u8
+#EXTINF:-1 tvg-id="CanalJ.fr" tvg-name="Canal J" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/3/3c/Canal_J_2019_Logo.png/512px-Canal_J_2019_Logo.png" group-title="kids",Canal J
+https://viamotionhsi.netplus.ch/live/eds/canalj/browser-HLS8/canalj.m3u8
+#EXTINF:-1 tvg-id="Caillou.fr" tvg-name="Caillou" tvg-logo="https://i.imgur.com/RgKaoe4.png" group-title="kids",Caillou
+https://do7nccdsswstc.cloudfront.net/v1/manifest/3722c60a815c199d9c0ef36c5b73da68a62b09d1/cc-1aso0bc668saa/a5233c83-f772-4a81-959a-45ec7877ef61/5.m3u8
+#EXTINF:-1 tvg-id="ADNTVPlus.fr" tvg-name="ADN TV+" tvg-logo="https://i.imgur.com/HQZQyWt.png" group-title="animation",ADN TV+
+https://d3b73b34o7cvkq.cloudfront.net/v1/master/3722c60a815c199d9c0ef36c5b73da68a62b09d1/cc-gz2sgqzp076kf/adn.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="Cine Western" tvg-logo="https://i.imgur.com/nNy9oTx.png" group-title="movies",Cine Western
+https://amg00711-zylo-amg00711c8-rakuten-uk-2686.playouts.now.amagi.tv/playlist/amg00711-zylofast-cinewestern-rakutenuk/playlist.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="Rakuten Film Action" tvg-logo="https://tse4.mm.bing.net/th/id/OIP.i6AXJ64CzfmGUlVkk-2FwAHaHq?r=0&rs=1&pid=ImgDetMain&o=7&rm=3" group-title="movies",Rakuten Film Action
+https://01ac9352fbfa4204998783d41f9b1a2e.mediatailor.eu-west-1.amazonaws.com/v1/master/0547f18649bd788bec7b67b746e47670f558b6b2/production-LiveChannel-6068/master.m3u8
+`;
+    let xmltvDoc = null;
+    const channelList = document.getElementById('channel-list');
+    const videoPlayerContainer = document.getElementById('video-player-container');
+    const video = document.getElementById('video-player');
+    const loadingMessage = document.getElementById('loading-message');
+    const errorMessage = document.getElementById('error-message');
+    const hlsStatus = document.getElementById('hls-status');
+    const dashStatus = document.getElementById('dash-status');
+    const btnSelfTest = document.getElementById('btn-selftest');
+    const filterBar = document.getElementById('filter-bar');
+    const programmeDisplay = document.getElementById('programme-display');
+
+    let hls = null, dashPlayer = null;
+    let selectedIndex = 0;
+    let currentFilter = "all";
+    let allChannels = [];
+    let filterIndex = 0;
+    let filterActive = true;
+
+    // Fonction pour charger et parser les données XMLTV
+    async function chargerXMLTV() {
+      try {
+        const response = await fetch('xmltv.xml');
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const xmlText = await response.text();
+        const parser = new DOMParser();
+        xmltvDoc = parser.parseFromString(xmlText, "application/xml");
+        console.log("Fichier xmltv.xml chargé avec succès.");
+      } catch (e) {
+        console.error("Échec du chargement du fichier XML. L'application continuera de fonctionner, mais sans le programme TV.", e);
+        // L'application ne s'arrête pas, mais le programme ne sera pas affiché.
+        // C'est un comportement voulu pour ne plus avoir de données par défaut.
+        xmltvDoc = null;
+      }
+    }
+
+    function afficherProgrammeEnLecteur(chaineId) {
+      if (!xmltvDoc) {
+        programmeDisplay.classList.add('hidden');
+        return;
+      }
+      const programme = getProgrammeNow(chaineId);
+      if (programme) {
+        programmeDisplay.innerHTML = `
+          <h3 class="font-bold text-lg">${programme.titre}</h3>
+          <p class="text-sm text-gray-300">
+            ${programme.start.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} - ${programme.stop.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+          </p>
+        `;
+        programmeDisplay.classList.remove('hidden');
+      } else {
+        programmeDisplay.innerHTML = `<p class="text-sm">Aucun programme en cours</p>`;
+        programmeDisplay.classList.remove('hidden');
+      }
+    }
+
+    function cacherProgrammeEnLecteur() {
+      programmeDisplay.classList.add('hidden');
+    }
+    
+    // Fonction pour convertir la date XMLTV en objet Date
+    function parseDate(str) {
+      // Format XMLTV : 20250906191500 +0200
+      const match = str.match(/(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+      const date = new Date(
+        `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`
+      );
+      const offsetMatch = str.match(/([+\-]\d{4})$/);
+      if (offsetMatch) {
+        const offset = offsetMatch[1];
+        const sign = offset[0];
+        const hours = parseInt(offset.substring(1, 3), 10);
+        const minutes = parseInt(offset.substring(3, 5), 10);
+        const totalMinutes = (sign === '-') ? -(hours * 60 + minutes) : (hours * 60 + minutes);
+        date.setMinutes(date.getMinutes() - totalMinutes);
+      }
+      return date;
+    }
+    
+    function getProgrammeNow(chaineId) {
+        if (!xmltvDoc) return null;
+        const programmes = [...xmltvDoc.querySelectorAll(`programme[channel="${chaineId}"]`)];
+        const now = new Date();
+        let actuel = null;
+        programmes.forEach(p => {
+          const start = parseDate(p.getAttribute("start"));
+          const stop = parseDate(p.getAttribute("stop"));
+          if (now >= start && now <= stop) {
+            actuel = {
+              titre: p.querySelector("title")?.textContent || "Sans titre",
+              start,
+              stop
+            };
+          }
+        });
+        return actuel;
+    }
+
+    function parseM3u(data){
+      const channels = [];
+      const lines = data.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith('#EXTINF:')){
+          const line = lines[i];
+          const url = lines[i+1];
+          if (!url) continue;
+
+          const nameMatch = /tvg-name="([^"]+)"/.exec(line) || /,([^,]+)$/.exec(line);
+          const logoMatch = /tvg-logo="([^"]+)"/.exec(line);
+          const groupMatch = /group-title="([^"]*)"/.exec(line);
+          const tvgIdMatch = /tvg-id="([^"]*)"/.exec(line);
+
+          const name = nameMatch ? nameMatch[1].trim() : 'Nom inconnu';
+          const logo = logoMatch ? logoMatch[1].trim() : '';
+          const group = groupMatch ? groupMatch[1].trim() : 'divers';
+          const tvgId = tvgIdMatch ? tvgIdMatch[1].trim() : null;
+
+          channels.push({name, logo, group, url, tvgId});
+          i++;
+        }
+      }
+      return channels;
+    }
+
+    function createFilterButtons(groups) {
+      filterBar.innerHTML = '';
+      const allBtn = document.createElement('button');
+      allBtn.className = 'badge filter-btn selected';
+      allBtn.dataset.filter = 'all';
+      allBtn.textContent = 'Tout';
+      filterBar.appendChild(allBtn);
+
+      groups.forEach(group => {
+        const btn = document.createElement('button');
+        btn.className = 'badge filter-btn';
+        btn.dataset.filter = group;
+        btn.textContent = group.charAt(0).toUpperCase() + group.slice(1);
+        filterBar.appendChild(btn);
+      });
+      updateFilterSelection();
+    }
+
+    function updateFilterSelection() {
+      const filterBtns = Array.from(document.querySelectorAll('#filter-bar .filter-btn'));
+      filterBtns.forEach((btn, i) => {
+        btn.classList.toggle('selected', i === filterIndex);
+        btn.tabIndex = 0;
+        if (i === filterIndex) btn.focus();
+      });
+    }
+
+    function updateSelection() {
+      const cards = Array.from(document.querySelectorAll('.channel-card'));
+      cards.forEach((card, i) => {
+        card.classList.toggle('selected', i === selectedIndex);
+        card.tabIndex = 0;
+        if (i === selectedIndex) card.focus();
+      });
+    }
+
+    function renderChannels(channels){
+      channelList.innerHTML = '';
+      channels.forEach(c => {
+        const card = document.createElement('div');
+        card.className = 'channel-card';
+        card.dataset.url = c.url;
+        card.dataset.name = c.name;
+        card.dataset.group = c.group;
+        card.dataset.tvgId = c.tvgId || '';
+        const img = document.createElement('img');
+        img.src = c.logo || 'https://placehold.co/100x100?text=TV';
+        img.alt = c.name;
+        const name = document.createElement('span');
+        name.textContent = c.name;
+        
+        const programme = getProgrammeNow(c.tvgId);
+        const programmeInfo = document.createElement('div');
+        programmeInfo.className = 'programme-info';
+        if (programme) {
+            programmeInfo.innerHTML = `
+                <h4>${programme.titre}</h4>
+                <p>${programme.start.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} - ${programme.stop.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</p>
+            `;
+        } else {
+            programmeInfo.innerHTML = `<h4>Aucun programme</h4><p>Non disponible</p>`;
+        }
+        
+        card.append(img, name, programmeInfo);
+        channelList.appendChild(card);
+      });
+      selectedIndex = 0;
+      updateSelection();
+    }
+
+    function filterChannels(filter) {
+      if (filter === "all") return allChannels;
+      return allChannels.filter(c => c.group.toLowerCase() === filter.toLowerCase());
+    }
+
+    function resetPlayers(){
+      try { if (hls){ hls.destroy(); hls = null; } } catch {}
+      try { if (dashPlayer){ dashPlayer.reset(); dashPlayer = null; } } catch {}
+      try { video.pause(); video.removeAttribute('src'); video.load(); } catch {}
+    }
+
+    async function playChannel(url, tvgId){
+      loadingMessage.style.display = 'block';
+      errorMessage.style.display = 'none';
+      videoPlayerContainer.classList.remove('hidden');
+      resetPlayers();
+
+      if (tvgId) afficherProgrammeEnLecteur(tvgId);
+      else cacherProgrammeEnLecteur();
+
+      try {
+        video.muted = true;
+
+        if (isProbablyHls(url)){
+          const ok = await ensureLib('Hls', HLS_CDNS);
+          if (!ok){ throw new Error('HLS library introuvable (CDN bloqué)'); }
+          hls = new window.Hls();
+          hls.on(window.Hls.Events.ERROR, (ev, data) => {
+            if (data.fatal){
+              showError('Erreur HLS fatale: ' + data.type);
+              resetPlayers();
+            }
+          });
+          hls.loadSource(url);
+          hls.attachMedia(video);
+          hls.on(window.Hls.Events.MANIFEST_PARSED, async () => {
+            try { await video.play(); video.muted = false; } catch(e){}
+          });
+          return;
+        }
+
+        if (isProbablyDash(url)){
+          const ok = await ensureLib('dashjs', DASH_CDNS);
+          if (!ok){ throw new Error('DASH (dashjs) introuvable dans cet environnement'); }
+          dashPlayer = window.dashjs.MediaPlayer().create();
+          dashPlayer.initialize(video, url, true);
+          setTimeout(() => { video.muted = false; }, 500);
+          return;
+        }
+
+        video.src = url;
+        await video.play();
+        video.muted = false;
+      } catch (err){
+        showError((err && err.message ? err.message : 'Erreur de lecture') + '\nLe flux est probablement bloqué par le serveur (CORS, géo-blocage, DRM).');
+        resetPlayers();
+        videoPlayerContainer.classList.add('hidden');
+      } finally {
+        loadingMessage.style.display = 'none';
+      }
+    }
+
+    function showError(msg){
+      errorMessage.textContent = msg || 'Impossible de charger cette chaîne.';
+      errorMessage.style.display = 'block';
+    }
+
+    function stopPlayback(){
+      resetPlayers();
+      videoPlayerContainer.classList.add('hidden');
+      errorMessage.style.display = 'none';
+      loadingMessage.style.display = 'none';
+      cacherProgrammeEnLecteur();
+    }
+
+    function refreshStatusBadges(){
+      const hlsOk = !!window.Hls;
+      hlsStatus.textContent = 'HLS: ' + (hlsOk ? 'chargé' : 'non chargé');
+      hlsStatus.classList.toggle('status-ok', hlsOk);
+      hlsStatus.classList.toggle('status-bad', !hlsOk);
+
+      const dashOk = !!window.dashjs;
+      dashStatus.textContent = 'DASH: ' + (dashOk ? 'chargé' : 'non chargé');
+      dashStatus.classList.toggle('status-ok', dashOk);
+      dashStatus.classList.toggle('status-bad', !dashOk);
+    }
+
+    async function runSelfTest(){
+      await ensureLib('Hls', HLS_CDNS);
+      await ensureLib('dashjs', DASH_CDNS);
+      refreshStatusBadges();
+
+      const tests = [
+        { name: 'TEST HLS (Mux)', url: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8' },
+        { name: 'TEST DASH (Akamai)', url: 'https://dash.akamaized.net/envivio/EnvivioDash3/manifest.mpd' }
+      ];
+
+      for (const t of tests){
+        try {
+          await playChannel(t.url);
+          await new Promise(r => setTimeout(r, 3000));
+          stopPlayback();
+        } catch { /* continue */ }
+      }
+    }
+
+    document.addEventListener('DOMContentLoaded', async () => {
+      allChannels = parseM3u(m3uData);
+      
+      const groups = [...new Set(allChannels.map(c => c.group))];
+      createFilterButtons(groups);
+      await chargerXMLTV();
+      renderChannels(allChannels);
+
+      refreshStatusBadges();
+      setTimeout(updateFilterSelection, 100);
+      
+      filterBar.addEventListener('click', (e) => {
+        const btn = e.target.closest('.filter-btn');
+        if (!btn) return;
+        currentFilter = btn.dataset.filter;
+        Array.from(document.querySelectorAll('#filter-bar .filter-btn')).forEach(b => b.classList.remove('selected'));
+        btn.classList.add('selected');
+        renderChannels(filterChannels(currentFilter));
+        selectedIndex = 0;
+        filterActive = false;
+        setTimeout(updateSelection, 100);
+      });
+    });
+
+    channelList.addEventListener('click', (e) => {
+      const cards = Array.from(document.querySelectorAll('.channel-card'));
+      const card = e.target.closest('.channel-card');
+      if (!card) return;
+      selectedIndex = cards.indexOf(card);
+      updateSelection();
+      const tvgId = card.dataset.tvgId;
+      playChannel(card.dataset.url, tvgId);
+    });
+
+    document.addEventListener('keydown', (e) => {
+      const cards = Array.from(document.querySelectorAll('.channel-card'));
+      const grid = document.querySelector('.grid-container');
+      const style = window.getComputedStyle(grid);
+      const columns = parseInt(style.getPropertyValue('grid-template-columns').split(' ').length);
+      const filterBtns = Array.from(document.querySelectorAll('#filter-bar .filter-btn'));
+
+      if (e.key === 'Tab' || e.key === 't') {
+        filterActive = !filterActive;
+        if (filterActive) {
+          updateFilterSelection();
+        } else {
+          selectedIndex = 0;
+          updateSelection();
+        }
+        e.preventDefault();
+        return;
+      }
+
+      if (filterActive) {
+        if (e.key === 'ArrowRight') {
+          filterIndex = (filterIndex + 1) % filterBtns.length;
+          updateFilterSelection();
+          e.preventDefault();
+        }
+        if (e.key === 'ArrowLeft') {
+          filterIndex = (filterIndex - 1 + filterBtns.length) % filterBtns.length;
+          updateFilterSelection();
+          e.preventDefault();
+        }
+        if (e.key === 'ArrowDown') {
+          filterActive = false;
+          selectedIndex = 0;
+          updateSelection();
+          e.preventDefault();
+          return;
+        }
+        if (e.key === 'Enter') {
+          const btn = filterBtns[filterIndex];
+          if (btn) {
+            currentFilter = btn.dataset.filter;
+            Array.from(filterBtns).forEach(b => b.classList.remove('selected'));
+            btn.classList.add('selected');
+            renderChannels(filterChannels(currentFilter));
+            selectedIndex = 0;
+            filterActive = false;
+            setTimeout(updateSelection, 100);
+            e.preventDefault();
+          }
+        }
+        return;
+      }
+
+      if (!videoPlayerContainer.classList.contains('hidden')) {
+        if (
+          e.key === 'ArrowDown' || e.key === 'ArrowUp' ||
+          e.key === 'ArrowLeft' || e.key === 'ArrowRight' ||
+          e.key === 'Escape' || e.key === 'Backspace'
+        ) {
+          stopPlayback();
+          updateSelection();
+          e.preventDefault();
+        }
+        return;
+      }
+      
+      if (videoPlayerContainer.classList.contains('hidden')) {
+        if (e.key === 'ArrowDown') {
+          selectedIndex = Math.min(selectedIndex + columns, cards.length - 1);
+          updateSelection();
+          e.preventDefault();
+        }
+        if (e.key === 'ArrowUp') {
+          if (selectedIndex < columns) {
+            filterActive = true;
+            filterIndex = 0;
+            updateFilterSelection();
+            e.preventDefault();
+          } else {
+            selectedIndex = Math.max(selectedIndex - columns, 0);
+            updateSelection();
+            e.preventDefault();
+          }
+        }
+        if (e.key === 'ArrowRight') {
+          selectedIndex = (selectedIndex + 1) % cards.length;
+          updateSelection();
+          e.preventDefault();
+        }
+        if (e.key === 'ArrowLeft') {
+          selectedIndex = (selectedIndex - 1 + cards.length) % cards.length;
+          updateSelection();
+          e.preventDefault();
+        }
+        if (e.key === 'Enter') {
+          if (cards[selectedIndex]) {
+            const tvgId = cards[selectedIndex].dataset.tvgId;
+            playChannel(cards[selectedIndex].dataset.url, tvgId);
+            e.preventDefault();
+          }
+        }
+      }
+    });
+
+    video.addEventListener('playing', () => { loadingMessage.style.display = 'none'; });
+    video.addEventListener('error', () => { showError('Erreur vidéo'); });
+
+    btnSelfTest.addEventListener('click', () => runSelfTest());
+  </script>
+</body>
+</html>
